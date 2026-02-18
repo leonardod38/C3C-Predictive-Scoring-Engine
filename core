@@ -1,0 +1,189 @@
+"""
+Projeto C3C - Motor de Inferência Sniper (Layer 4)
+---------------------------------------------------------
+Arquivo: main_inference_sniper_l4.py
+Descrição: Pipeline de alta precisão para escoragem de candidatos 
+           integrando modelos CatBoost com infraestrutura Oracle.
+Versão: 2.1.0
+Padrão: Corporativo (MLOps / Clean Code)
+"""
+
+import os
+import sys
+import time
+import logging
+import pickle
+import traceback
+from datetime import datetime
+from typing import List, Tuple, Optional, Any
+
+import oracledb
+import pandas as pd
+import numpy as np
+
+# Verificação de dependências críticas
+try:
+    from catboost import CatBoostClassifier
+except ImportError:
+    logging.critical("ERRO: Biblioteca 'catboost' é mandatória para este motor.")
+    sys.exit(1)
+
+# ============================================================================
+# CONFIGURAÇÕES CORPORATIVAS
+# ============================================================================
+class Config:
+    """Parâmetros do sistema e limites de negócio."""
+    DB_USER = "C3C"
+    DB_PASS = "A7d9Pq2"
+    DB_DSN = "192.168.1.51:1521/XEPDB1"
+    
+    # Arquivos e Caminhos
+    MODEL_PATH = "modelo_layer4_sniper.pkl"
+    LOG_PATH = "main_inference_l4.log"
+    RANKING_PATH = "ranking.txt"
+    
+    # Parâmetros Sniper (Zona de Ouro)
+    SCORE_MIN = 20.00
+    SCORE_MAX = 50.00
+    LIMIT_RECORDS = 50
+    
+
+# ============================================================================
+# CONFIGURAÇÃO DE LOGGING
+# ============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [%(levelname)s] - %(name)s - %(message)s',
+    handlers=[
+        logging.FileHandler(Config.LOG_PATH, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("InferenceEngineL4")
+
+# ============================================================================
+# NÚCLEO DE DADOS
+# ============================================================================
+class DatabaseManager:
+    """Gerencia conexões e integridade no Oracle Database."""
+    
+    @staticmethod
+    def get_connection() -> oracledb.Connection:
+        try:
+            return oracledb.connect(
+                user=Config.DB_USER, 
+                password=Config.DB_PASS, 
+                dsn=Config.DB_DSN
+            )
+        except oracledb.Error as e:
+            logger.error(f"Falha na conexão Oracle: {e}")
+            raise
+
+# ============================================================================
+# MOTOR DE INFERÊNCIA
+# ============================================================================
+class SniperInferenceEngine:
+    """Processa a inteligência preditiva e filtragem Zona de Ouro."""
+
+    def __init__(self):
+        self.model = self._load_model()
+
+    def _load_model(self) -> Any:
+        if not os.path.exists(Config.MODEL_PATH):
+            raise FileNotFoundError(f"Modelo não localizado: {Config.MODEL_PATH}")
+        
+        with open(Config.MODEL_PATH, "rb") as f:
+            return pickle.load(f)
+
+    def run_scoring(self, raw_data: List[Tuple]) -> List[Tuple]:
+        """Aplica o modelo e filtra candidatos conforme as regras Sniper."""
+        if not raw_data:
+            return []
+
+        # Extração de features (Índice 2 em diante conforme estrutura da query)
+        features = [list(row[2:]) for row in raw_data]
+        
+        # Inferência de Probabilidades
+        probs = self.model.predict_proba(features)[:, 1]
+        
+        candidates = []
+        for i, row in enumerate(raw_data):
+            score = float(probs[i]) * 100
+            
+            # Aplicação da Regra: Zona de Ouro (20-50%)
+            if Config.SCORE_MIN <= score <= Config.SCORE_MAX:
+                candidates.append((row[0], row[1], score))
+        
+        # Ordenação e limite de saída
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        return candidates[:Config.LIMIT_RECORDS]
+
+# ============================================================================
+# EXECUÇÃO (MAIN PIPELINE)
+# ============================================================================
+def main():
+    """Fluxo principal de inferência Layer 4."""
+    logger.info("Iniciando Pipeline: main_inference_sniper_l4.py")
+    start_time = time.time()
+
+    try:
+        with DatabaseManager.get_connection() as conn:
+            with conn.cursor() as cursor:
+                
+                # 1. Ingestão de Candidatos do Layer 3
+                logger.info("Coletando dados qualificados para inferência...")
+                sql_fetch = """
+                    SELECT 
+                        l3.ID, l3.PALPITE_L3,
+                        l3.PROBABILIDADE_L3, cat.CONFIANCA, jax.CONFIANCA,
+                        ABS(l3.PROBABILIDADE_L3 - cat.CONFIANCA),
+                        ABS(cat.CONFIANCA - jax.CONFIANCA)
+                    FROM TB_LAYER3_PREDICOES l3
+                    INNER JOIN TB_CATBOOST_PREDICOES cat ON l3.ID = cat.ID AND l3.PALPITE_L3 = cat.PALPITE_CATBOOST
+                    INNER JOIN TB_JAX_PREDICOES jax ON l3.ID = jax.ID
+                    WHERE l3.DATA_L3 >= TRUNC(SYSDATE)
+                """
+                cursor.execute(sql_fetch)
+                rows = cursor.fetchall()
+                
+                if not rows:
+                    logger.warning("Processamento interrompido: Nenhum dado de entrada localizado.")
+                    return
+
+                # 2. Execução da Inferência
+                engine = SniperInferenceEngine()
+                top_candidates = engine.run_scoring(rows)
+                
+                # 3. Persistência e Log de Ranking
+                if top_candidates:
+                    # Limpeza do ciclo diário
+                    cursor.execute("DELETE FROM TB_LAYER4_SNIPER WHERE DATA_L4 >= TRUNC(SYSDATE)")
+                    
+                    sql_merge = """
+                    MERGE INTO TB_LAYER4_SNIPER d
+                    USING (SELECT :1 id, :2 palp, :3 score, :4 decisao FROM dual) s
+                    ON (d.ID = s.id AND d.PALPITE_FINAL = s.palp)
+                    WHEN MATCHED THEN UPDATE SET 
+                        d.SCORE_SNIPER = s.score, d.DECISAO_FINAL = s.decisao, d.DATA_L4 = SYSDATE
+                    WHEN NOT MATCHED THEN INSERT (ID, PALPITE_FINAL, SCORE_SNIPER, DECISAO_FINAL, DATA_L4)
+                        VALUES (s.id, s.palp, s.score, s.decisao, SYSDATE)
+                    """
+                    data_to_save = [(*c, "ZONA_OURO") for c in top_candidates]
+                    cursor.executemany(sql_merge, data_to_save)
+                    conn.commit()
+                    
+                    # Atualização do ranking físico (Auditoria)
+                    with open(Config.RANKING_PATH, "w") as f:
+                        f.write(f"--- RANKING INFERÊNCIA {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} ---\n")
+                        for item in top_candidates:
+                            f.write(f"ID: {item[0]} | Palpite: {item[1]} | Score: {item[2]:.4f}\n")
+
+                    logger.info(f"Inferência concluída. {len(top_candidates)} registros persistidos no Oracle.")
+
+    except Exception:
+        logger.error(f"Falha crítica na execução:\n{traceback.format_exc()}")
+    finally:
+        logger.info(f"Tempo total de processamento: {time.time() - start_time:.2f}s")
+
+if __name__ == "__main__":
+    main()
